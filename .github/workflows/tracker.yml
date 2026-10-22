@@ -1,0 +1,44 @@
+name: Theo Doi CTSV HUIT
+
+on:
+  schedule:
+    # 8h00 đến 16h30 giờ VN (UTC+7) -> Giờ UTC là 1h00 đến 9h30
+    # Chạy các ngày Thứ 2 đến Thứ 6 (1-5). Bỏ Thứ 7 và Chủ Nhật.
+    # Cứ mỗi 10 phút quét 1 lần:
+    - cron: '*/10 1-9 * * 1-5'
+    - cron: '0,10,20,30 10 * * 1-5'
+  workflow_dispatch: # Cho phép bấm nút "Run workflow" bằng tay trên web GitHub bất cứ lúc nào
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+
+      - name: Run CTSV Tracker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PAGE_URL: "https://www.facebook.com/ctsv.huit"
+        run: |
+          python bot.py --once
+
+      - name: Save seen posts
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add seen_posts.json
+          git commit -m "update: seen posts" || echo "Không có bài mới, bỏ qua commit"
+          git push

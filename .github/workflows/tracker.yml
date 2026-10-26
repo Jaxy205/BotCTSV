@@ -22,10 +22,21 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Cache Playwright Browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-browsers-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          playwright install chromium --with-deps
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
+            playwright install chromium --with-deps
+          else
+            playwright install-deps chromium
+          fi
 
       - name: Run CTSV Tracker
         env:

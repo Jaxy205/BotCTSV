@@ -183,6 +183,16 @@ async def check_fanpage(browser, seen_posts):
                 print(f"[BÀI MỚI PHÁT HIỆN]: {link}")
                 send_telegram(message, reply_markup=keyboard)
 
+                # Nếu là bài CTXH hoặc có link form -> Gửi chuỗi báo động rung liên tục 2 lần nữa
+                if is_ctxh or has_form:
+                    await asyncio.sleep(1.5)
+                    alert_1 = "🚨🚨🚨 <b>BÁO ĐỘNG ĐỎ: CÓ FORM CTXH MỚI!</b> 🚨🚨🚨\n👉 Bấm vào form điền ngay kẻo full slot bạn ơi!"
+                    send_telegram(alert_1)
+                    
+                    await asyncio.sleep(1.5)
+                    alert_2 = "⚡⚡⚡ <b>ĐỪNG BỎ LỠ!</b> Kiểm tra form đăng ký ngay lập tức! ⚡⚡⚡"
+                    send_telegram(alert_2)
+
         if new_found > 0:
             save_seen_posts(seen_posts)
             print(f"-> Đã gửi thông báo {new_found} bài mới qua Telegram.")

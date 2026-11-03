@@ -101,51 +101,64 @@ async def check_fanpage(browser, seen_posts):
     try:
         now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
         print(f"[{now_str}] Đang quét fanpage CTSV...")
-        await page.goto(CONFIG["PAGE_URL"], wait_until="networkidle", timeout=30000)
+        await page.goto(CONFIG["PAGE_URL"], wait_until="domcontentloaded", timeout=35000)
         await page.wait_for_timeout(2000)
 
-        # Đóng popup đăng nhập Facebook nếu xuất hiện
-        for selector in ['div[aria-label="Đóng"]', 'div[aria-label="Close"]', 'div[role="button"][aria-label*="Đóng"]']:
+        # Xử lý các loại popup: Đăng nhập, Cookie consent trên server nước ngoài
+        popup_selectors = [
+            'div[aria-label="Đóng"]', 'div[aria-label="Close"]', 'div[role="button"][aria-label*="Đóng"]',
+            'button[data-cookiebanner="accept_button"]', 'button:has-text("Allow all cookies")',
+            'button:has-text("Decline optional cookies")', 'button:has-text("Chấp nhận tất cả")',
+            'div[aria-label="Allow all cookies"]', 'div[aria-label="Decline optional cookies"]',
+            '[aria-label="Decline optional cookies"]', '[data-testid="cookie-policy-manage-dialog-accept-button"]'
+        ]
+        for selector in popup_selectors:
             try:
                 btn = page.locator(selector).first
                 if await btn.is_visible():
                     await btn.click()
+                    await page.wait_for_timeout(1000)
                     break
             except Exception:
                 pass
 
-        # Lấy danh sách link bài viết
-        links = await page.eval_on_selector_all("a[href]", "elements => elements.map(e => e.href)")
-        clean_post_links = []
-        for l in links:
-            if ("/posts/" in l or "permalink.php" in l) and "ctsv.huit" in l:
-                clean_url = l.split("?")[0]
-                if clean_url not in clean_post_links:
-                    clean_post_links.append(clean_url)
+        # Cuộn nhẹ xuống để Facebook render đầy đủ các bài viết mới
+        await page.evaluate("window.scrollBy(0, 1000)")
+        await page.wait_for_timeout(2500)
 
-        # Lấy nội dung text bài viết đầu trang
+        # 1. Tìm theo từng khối bài viết (Feed item)
         articles = await page.locator('div[role="feed"] > div, div[role="article"]').all()
-        post_texts = []
-        for art in articles[:5]:
+        processed_ids = set()
+
+        for art in articles[:6]:
             try:
-                txt = await art.inner_text()
-                if len(txt.strip()) > 30:
-                    post_texts.append(txt.strip())
-            except Exception:
-                pass
+                art_text = (await art.inner_text()).strip()
+                if len(art_text) < 30:
+                    continue
 
-        top_text = post_texts[0] if post_texts else ""
-        forms_found = extract_forms(top_text)
+                # Lấy link bài viết bên trong chính khối này
+                art_links = await art.eval_on_selector_all("a[href]", "elements => elements.map(e => e.href)")
+                post_url = None
+                for l in art_links:
+                    if ("/posts/" in l or "permalink.php" in l or "story_fbid" in l) and "ctsv.huit" in l:
+                        clean_url = l.split("?")[0]
+                        if clean_url and "ctsv.huit" in clean_url:
+                            post_url = clean_url
+                            break
 
-        # Định danh bài viết bằng ID trong link hoặc hash tiêu đề
-        for link in clean_post_links[:3]:
-            post_id = link.rstrip("/").split("/")[-1]
-            if post_id not in seen_posts:
+                if not post_url:
+                    continue
+
+                post_id = post_url.rstrip("/").split("/")[-1]
+                if post_id in seen_posts or post_id in processed_ids:
+                    continue
+
+                processed_ids.add(post_id)
                 seen_posts.add(post_id)
                 new_found += 1
-                
-                # Kiểm tra độ ưu tiên (CTXH / Form)
-                is_ctxh = any(kw in top_text.lower() for kw in ["ctxh", "công tác xã hội", "đăng ký", "slot", "tình nguyện"])
+
+                forms_found = extract_forms(art_text)
+                is_ctxh = any(kw in art_text.lower() for kw in ["ctxh", "công tác xã hội", "đăng ký", "slot", "tình nguyện"])
                 has_form = len(forms_found) > 0
 
                 header = "🚨 <b>[CÓ LINK ĐĂNG KÝ CTXH MỚI]</b> 🚨\n" if (is_ctxh or has_form) else "📢 <b>BÀI VIẾT MỚI TỪ CTSV HUIT</b>\n"
@@ -157,33 +170,25 @@ async def check_fanpage(browser, seen_posts):
                         msg_lines.append(f"👉 <a href='{f}'>{f}</a>")
                     msg_lines.append("")
 
-                # Trích dẫn nội dung bài viết
-                preview = top_text[:400] + ("..." if len(top_text) > 400 else "")
+                preview = art_text[:400] + ("..." if len(art_text) > 400 else "")
                 msg_lines.append(f"📝 <b>Nội dung tóm tắt:</b>\n{preview}\n")
-                msg_lines.append(f"🔗 <a href='{link}'>Xem bài viết gốc trên Facebook</a>")
+                msg_lines.append(f"🔗 <a href='{post_url}'>Xem bài viết gốc trên Facebook</a>")
 
                 message = "\n".join(msg_lines)
-                
-                # Nút bấm mở link form nhanh trên Telegram
-                keyboard = None
-                if forms_found:
-                    keyboard = {
-                        "inline_keyboard": [
-                            [{"text": "🚀 MỞ FORM ĐĂNG KÝ NGAY", "url": forms_found[0]}],
-                            [{"text": "📖 Mở bài viết Facebook", "url": link}]
-                        ]
-                    }
-                else:
-                    keyboard = {
-                        "inline_keyboard": [
-                            [{"text": "📖 Xem bài viết Facebook", "url": link}]
-                        ]
-                    }
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "🚀 MỞ FORM ĐĂNG KÝ NGAY", "url": forms_found[0]}],
+                        [{"text": "📖 Xem bài viết Facebook", "url": post_url}]
+                    ]
+                } if forms_found else {
+                    "inline_keyboard": [
+                        [{"text": "📖 Xem bài viết Facebook", "url": post_url}]
+                    ]
+                }
 
-                print(f"[BÀI MỚI PHÁT HIỆN]: {link}")
+                print(f"[BÀI MỚI PHÁT HIỆN]: {post_url}")
                 send_telegram(message, reply_markup=keyboard)
 
-                # Nếu là bài CTXH hoặc có link form -> Gửi chuỗi báo động rung liên tục 2 lần nữa
                 if is_ctxh or has_form:
                     await asyncio.sleep(1.5)
                     alert_1 = "🚨🚨🚨 <b>BÁO ĐỘNG ĐỎ: CÓ FORM CTXH MỚI!</b> 🚨🚨🚨\n👉 Bấm vào form điền ngay kẻo full slot bạn ơi!"
@@ -192,6 +197,25 @@ async def check_fanpage(browser, seen_posts):
                     await asyncio.sleep(1.5)
                     alert_2 = "⚡⚡⚡ <b>ĐỪNG BỎ LỠ!</b> Kiểm tra form đăng ký ngay lập tức! ⚡⚡⚡"
                     send_telegram(alert_2)
+
+            except Exception as art_err:
+                print(f"[Lỗi đọc bài]: {art_err}")
+
+        # 2. Fallback nếu không bóc tách được bằng container
+        if new_found == 0 and len(processed_ids) == 0:
+            page_links = await page.eval_on_selector_all("a[href]", "elements => elements.map(e => e.href)")
+            for l in page_links:
+                if ("/posts/" in l or "permalink.php" in l) and "ctsv.huit" in l:
+                    clean_url = l.split("?")[0]
+                    post_id = clean_url.rstrip("/").split("/")[-1]
+                    if post_id not in seen_posts:
+                        seen_posts.add(post_id)
+                        new_found += 1
+                        msg = f"📢 <b>BÀI VIẾT MỚI TỪ CTSV HUIT</b>\n\n🔗 <a href='{clean_url}'>Xem bài viết gốc trên Facebook</a>"
+                        kb = {"inline_keyboard": [[{"text": "📖 Xem bài viết Facebook", "url": clean_url}]]}
+                        print(f"[BÀI MỚI FALLBACK]: {clean_url}")
+                        send_telegram(msg, reply_markup=kb)
+                        break
 
         if new_found > 0:
             save_seen_posts(seen_posts)

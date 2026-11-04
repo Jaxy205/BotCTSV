@@ -1,20 +1,30 @@
+
 name: Theo Doi CTSV HUIT
 
 on:
   schedule:
-    # Buổi sáng: 08:03–11:23 (Việt Nam)
+    # Sang: 08:03 - 11:23 VN
     - cron: '3-53/10 1-3 * * 1-5'
     - cron: '3-23/10 4 * * 1-5'
 
-    # Buổi chiều: 13:03–16:23 (Việt Nam)
+    # Chieu: 13:03 - 16:23 VN
     - cron: '3-53/10 6-8 * * 1-5'
     - cron: '3-23/10 9 * * 1-5'
 
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: ctsv-tracker
+  cancel-in-progress: false
+
 jobs:
   track:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -51,8 +61,15 @@ jobs:
 
       - name: Save seen posts
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
           git add seen_posts.json
-          git commit -m "update: seen posts" || echo "Không có bài mới, bỏ qua commit"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "Khong co thay doi."
+          else
+            git commit -m "update: seen posts"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi

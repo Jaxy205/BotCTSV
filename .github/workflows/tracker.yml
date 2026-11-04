@@ -53,12 +53,12 @@ jobs:
         run: python bot.py --once
 
       - name: Upload Facebook diagnostic screenshot
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: facebook-debug-${{ github.run_number }}
-          path: debug/facebook_page.png
-          if-no-files-found: ignore
+          path: debug/
+          if-no-files-found: warn
           retention-days: 3
 
       - name: Save seen posts

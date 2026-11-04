@@ -1,343 +1,476 @@
+
+"""Theo doi bai dang cong khai cua fanpage CTSV HUIT.
+
+Moi bai moi -> 1 tin Telegram. Noi dung co 'CTXH' / 'cong tac xa hoi'
+-> canh bao. Link form neu co -> nut mo nhanh.
+
+Luu y: Facebook co the gioi han so bai hien thi khi khong dang nhap;
+script khong the dam bao phat hien cac bai Facebook khong tai ve.
+"""
+
 import asyncio
 import html
 import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from pathlib import Path
+
 from playwright.async_api import async_playwright
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
-# Đường dẫn file
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ENV_FILE = os.path.join(BASE_DIR, ".env")
-DB_FILE = os.path.join(BASE_DIR, "seen_posts.json")
+BASE_DIR = Path(__file__).resolve().parent
+DB_FILE = BASE_DIR / "seen_posts.json"
+DEBUG_DIR = BASE_DIR / "debug"
+
 
 def load_config():
     config = {
         "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", ""),
-        "CHECK_INTERVAL_SECONDS": int(os.environ.get("CHECK_INTERVAL_SECONDS", 120)),
-        "PAGE_URL": os.environ.get("PAGE_URL", "https://www.facebook.com/ctsv.huit")
+        "PAGE_URL": os.environ.get("PAGE_URL", "https://www.facebook.com/ctsv.huit"),
+        "CHECK_INTERVAL_SECONDS": os.environ.get("CHECK_INTERVAL_SECONDS", "120"),
     }
-    if os.path.exists(ENV_FILE):
-        with open(ENV_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, val = line.split("=", 1)
-                    if not config.get(key.strip()):
-                        config[key.strip()] = val.strip()
+    env_file = BASE_DIR / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                if key.strip() in config and not os.environ.get(key.strip()):
+                    config[key.strip()] = value.strip().strip('"').strip("'")
     return config
+
 
 CONFIG = load_config()
 
-def send_telegram(text: str, reply_markup=None):
-    token = CONFIG["TELEGRAM_BOT_TOKEN"]
-    chat_id = CONFIG["TELEGRAM_CHAT_ID"]
-    if not token or not chat_id:
-        print("[LỖI] Thiếu TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID trong .env")
-        return False
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
-
-    try:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
-    except Exception as e:
-        print(f"[LỖI GỬI TELEGRAM]: {e}")
-        return False
 
 def load_seen_posts():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except Exception:
-            return set()
-    return set()
-
-def save_seen_posts(seen: set):
-    # Không cắt ngẫu nhiên các ID: tránh gửi lại bài cũ khi set đổi thứ tự.
-    post_list = sorted(seen)
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(post_list, f, ensure_ascii=False, indent=2)
-
-def extract_forms(text: str):
-    """Tìm tất cả các link form (Google Form, MS Form, v.v.) trong nội dung"""
-    patterns = [
-        r'https?://(?:forms\.gle|docs\.google\.com/forms|forms\.office\.com|goo\.gl/forms)[^\s\)\"\'>]+',
-        r'https?://[^\s\)\"\'>]+(?:form|dang-ky|dangky)[^\s\)\"\'>]*'
-    ]
-    forms = []
-    for pat in patterns:
-        matches = re.findall(pat, text, re.IGNORECASE)
-        for m in matches:
-            clean = m.rstrip(".,;!?")
-            if clean not in forms:
-                forms.append(clean)
-    return forms
-
-def is_post_link(link: str) -> bool:
+    if not DB_FILE.exists():
+        return set()
     try:
-        parsed = urllib.parse.urlparse(link)
-        if (parsed.hostname or "").lower() not in ("facebook.com", "www.facebook.com", "m.facebook.com"):
-            return False
-        path = parsed.path.lower()
-        query = urllib.parse.parse_qs(parsed.query)
-        return (
-            ("/ctsv.huit/posts/" in path)
-            or (path.endswith("/permalink.php") and bool(query.get("story_fbid")))
-            or (path.endswith("/story.php") and bool(query.get("story_fbid")))
-        )
+        raw = json.loads(DB_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, list) or any(not isinstance(x, str) for x in raw):
+            raise ValueError("seen_posts.json phai la mang chuoi ID")
+        return set(raw)
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(f"Khong doc duoc seen_posts.json: {exc}") from exc
+
+
+def save_seen_posts(seen):
+    """Ghi atomically de tranh JSON bi cat neu job dung giua chung."""
+    tmp = DB_FILE.with_name(DB_FILE.name + ".tmp")
+    tmp.write_text(
+        json.dumps(sorted(seen), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp, DB_FILE)
+
+
+def normalize_post_url(link):
+    """Tra ve (post_id, url) cho link bai CTSV; nguoc lai None."""
+    if not isinstance(link, str):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(link)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in ("http", "https") or host not in (
+            "facebook.com", "www.facebook.com", "m.facebook.com"
+        ):
+            return None
+
+        path = parsed.path.rstrip("/")
+        path_lower = path.lower()
+        prefix = "/ctsv.huit/posts/"
+
+        if path_lower.startswith(prefix):
+            post_id = path[len(prefix):].split("/", 1)[0]
+            if not post_id:
+                return None
+            url = "https://www.facebook.com/ctsv.huit/posts/" + urllib.parse.quote(
+                urllib.parse.unquote(post_id), safe=""
+            )
+            clean_id = urllib.parse.unquote(post_id)
+            return (
+                clean_id if clean_id.startswith("pfbid") else "fbid:" + clean_id
+            ), url
+
+        if path_lower in ("/permalink.php", "/story.php"):
+            query = urllib.parse.parse_qs(parsed.query)
+            story_id = query.get("story_fbid", [""])[0]
+            if not story_id:
+                return None
+
+            q = {"story_fbid": story_id}
+            if query.get("id", [""])[0]:
+                q["id"] = query["id"][0]
+
+            url = (
+                "https://www.facebook.com"
+                + path_lower
+                + "?"
+                + urllib.parse.urlencode(q)
+            )
+            post_id = story_id if story_id.startswith("pfbid") else "fbid:" + story_id
+            return post_id, url
+
     except (ValueError, TypeError):
+        return None
+    return None
+
+
+def is_ctxh(text):
+    return bool(
+        re.search(
+            r"(?<!\w)ctxh(?!\w)|công\s+tác\s+xã\s+hội",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def extract_forms(text, links=()):
+    pattern = r"https?://[^\s\"'<>\\)]+"
+    candidates = re.findall(pattern, text) + list(links)
+    out = []
+
+    for value in candidates:
+        url = str(value).rstrip(".,;!?)]}")
+
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            host = (parsed.hostname or "").lower()
+
+            if host == "l.facebook.com":
+                target = urllib.parse.parse_qs(parsed.query).get("u", [""])[0]
+                if not target:
+                    continue
+                url = target
+                parsed = urllib.parse.urlsplit(url)
+                host = (parsed.hostname or "").lower()
+
+        except ValueError:
+            continue
+
+        if parsed.scheme not in ("http", "https") or not host:
+            continue
+
+        is_form = (
+            host == "forms.gle"
+            or host in ("forms.office.com", "forms.microsoft.com")
+            or (host == "docs.google.com" and parsed.path.startswith("/forms/"))
+            or (
+                host not in (
+                    "facebook.com", "www.facebook.com", "m.facebook.com"
+                )
+                and any(
+                    s in url.lower()
+                    for s in ("/form", "dang-ky", "dangky")
+                )
+            )
+        )
+
+        if is_form and url not in out:
+            out.append(url)
+
+    return out[:5]
+
+
+def send_telegram(message, keyboard=None):
+    token = CONFIG["TELEGRAM_BOT_TOKEN"]
+    chat_id = CONFIG["TELEGRAM_CHAT_ID"]
+
+    if not token or not chat_id:
+        raise RuntimeError(
+            "Thieu TELEGRAM_BOT_TOKEN hoac TELEGRAM_CHAT_ID"
+        )
+
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+
+    if keyboard:
+        payload["reply_markup"] = keyboard
+
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=json.dumps(
+            payload, ensure_ascii=False
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            result = json.load(response)
+            return response.status == 200 and result.get("ok") is True
+
+    except urllib.error.HTTPError as exc:
+        print(f"[TELEGRAM] HTTP error {exc.code}")
+        return False
+
+    except (urllib.error.URLError, ValueError, OSError) as exc:
+        print(f"[TELEGRAM] Loi ket noi: {type(exc).__name__}")
         return False
 
 
-def get_post_id(url: str):
-    if not is_post_link(url):
-        return None
-    parsed = urllib.parse.urlparse(url)
-    query = urllib.parse.parse_qs(parsed.query)
-    if query.get("story_fbid"):
-        return "fbid:" + query["story_fbid"][0]
-    if "/posts/" in parsed.path:
-        return parsed.path.rstrip("/").split("/")[-1]
-    return None
+def make_message(post):
+    text = post["text"].strip()
+    alt_text = post.get("alt", "")
+    combined = text + "\n" + alt_text
+
+    ctxh = is_ctxh(combined)
+    forms = extract_forms(combined, post["links"])
+
+    title = (
+        "🚨 <b>BÀI MỚI CÓ CTXH – KIỂM TRA NGAY</b>"
+        if ctxh
+        else "📢 <b>BÀI MỚI TỪ CTSV HUIT</b>"
+    )
+
+    parts = [title]
+
+    if ctxh:
+        parts.append("⚠️ Phát hiện từ khóa CTXH / Công tác xã hội.")
+
+    if text:
+        preview = text[:700] + ("…" if len(text) > 700 else "")
+        parts.append("📝 " + html.escape(preview))
+    else:
+        parts.append(
+            "⚠️ Chưa trích xuất được nội dung chữ của bài đăng."
+        )
+
+    if forms:
+        parts.append(
+            "📝 <b>Link form:</b> " + html.escape(forms[0])
+        )
+
+    parts.append(
+        '<a href="'
+        + html.escape(post["url"], quote=True)
+        + '">Xem bài viết Facebook</a>'
+    )
+
+    buttons = []
+
+    if forms:
+        buttons.append([
+            {"text": "📝 Mở form đăng ký", "url": forms[0]}
+        ])
+
+    buttons.append([
+        {"text": "📖 Xem bài Facebook", "url": post["url"]}
+    ])
+
+    return "\n\n".join(parts), {"inline_keyboard": buttons}
+
+
+EXTRACT_JS = r"""
+anchors => anchors.filter(a => /\/posts\/|permalink\.php|story\.php/i.test(a.href)).map(a => {
+    const card = a.closest('div[role="article"], div[role="feed"] > div, [data-pagelet*="FeedUnit"]');
+    return {
+        url: a.href,
+        text: card ? (card.innerText || '').slice(0, 6000) : '',
+        links: card ? Array.from(card.querySelectorAll('a[href]')).map(x => x.href).slice(0, 60) : [],
+        alt: card ? Array.from(card.querySelectorAll('img[alt]')).map(x => x.alt || '').join(' ').slice(0, 1200) : ''
+    };
+})
+"""
+
+
+async def collect_posts(page):
+    posts = {}
+
+    for round_index in range(3):
+        await page.wait_for_timeout(
+            1800 if round_index == 0 else 1600
+        )
+
+        raw = await page.locator("a[href]").evaluate_all(EXTRACT_JS)
+
+        for item in raw:
+            normalized = normalize_post_url(item.get("url", ""))
+
+            if not normalized:
+                continue
+
+            post_id, url = normalized
+
+            candidate = {
+                "id": post_id,
+                "url": url,
+                "text": item.get("text") or "",
+                "alt": item.get("alt") or "",
+                "links": item.get("links") or [],
+            }
+
+            current = posts.get(post_id)
+
+            if not current:
+                posts[post_id] = candidate
+            else:
+                if len(candidate["text"]) > len(current["text"]):
+                    current["text"] = candidate["text"]
+                    current["alt"] = candidate["alt"]
+
+                current["links"] = list(
+                    dict.fromkeys(
+                        current["links"] + candidate["links"]
+                    )
+                )
+
+        print(
+            f"[DEBUG] Luot {round_index + 1}: "
+            f"{len(raw)} link nghi la bai, "
+            f"{len(posts)} ID hop le"
+        )
+
+        if round_index < 2:
+            await page.evaluate(
+                "window.scrollBy(0, Math.max(700, window.innerHeight * 0.8))"
+            )
+
+    return posts
+
+
+async def save_debug_image(page):
+    DEBUG_DIR.mkdir(exist_ok=True)
+    path = DEBUG_DIR / "facebook_page.png"
+
+    try:
+        await page.screenshot(
+            path=str(path),
+            full_page=True,
+            timeout=12000,
+        )
+        print(f"[DEBUG] Da luu anh: {path}")
+
+    except Exception as exc:
+        print(
+            "[DEBUG] Khong chup duoc anh: "
+            f"{type(exc).__name__}"
+        )
 
 
 async def check_fanpage(browser, seen_posts):
     context = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        viewport={"width": 1280, "height": 900}
+        locale="vi-VN",
+        viewport={"width": 1280, "height": 900},
     )
-    page = await context.new_page()
-    new_found = 0
 
     try:
-        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
-        print(f"[{now_str}] Đang quét fanpage CTSV...")
-        response = await page.goto(CONFIG["PAGE_URL"], wait_until="domcontentloaded", timeout=35000)
-        print(f"[DEBUG] HTTP status: {response.status if response else 'unknown'}")
-        print(f"[DEBUG] Final URL: {page.url}")
-        await page.wait_for_timeout(2000)
+        page = await context.new_page()
 
-        # Xử lý các loại popup: Đăng nhập, Cookie consent trên server nước ngoài
-        popup_selectors = [
-            'div[aria-label="Đóng"]', 'div[aria-label="Close"]', 'div[role="button"][aria-label*="Đóng"]',
-            'button[data-cookiebanner="accept_button"]', 'button:has-text("Allow all cookies")',
-            'button:has-text("Decline optional cookies")', 'button:has-text("Chấp nhận tất cả")',
-            'div[aria-label="Allow all cookies"]', 'div[aria-label="Decline optional cookies"]',
-            '[aria-label="Decline optional cookies"]', '[data-testid="cookie-policy-manage-dialog-accept-button"]'
-        ]
-        for selector in popup_selectors:
-            try:
-                btn = page.locator(selector).first
-                if await btn.is_visible():
-                    await btn.click()
-                    await page.wait_for_timeout(1000)
-                    break
-            except Exception:
-                pass
+        print(
+            f"[{datetime.now():%H:%M:%S - %d/%m/%Y}] "
+            "Dang quet CTSV HUIT"
+        )
 
-        # Cuộn để Facebook tải thêm nội dung rồi chờ render.
-        await page.evaluate("window.scrollBy(0, 1000)")
-        await page.wait_for_timeout(2500)
+        response = await page.goto(
+            CONFIG["PAGE_URL"],
+            wait_until="domcontentloaded",
+            timeout=35000,
+        )
 
-        # Luôn tạo ảnh chẩn đoán, kể cả khi workflow thành công.
-        debug_dir = os.path.join(BASE_DIR, "debug")
-        os.makedirs(debug_dir, exist_ok=True)
-        screenshot_path = os.path.join(debug_dir, "facebook_page.png")
-        try:
-            await page.screenshot(
-                path=screenshot_path,
-                full_page=True,
-                timeout=15000,
-                animations="disabled",
+        print(
+            f"[DEBUG] HTTP: "
+            f"{response.status if response else 'unknown'} "
+            f"| URL: {page.url}"
+        )
+
+        print(
+            f"[DEBUG] Tieu de: {(await page.title())[:120]}"
+        )
+
+        posts = await collect_posts(page)
+
+        await save_debug_image(page)
+
+        print(
+            f"[DEBUG] Co {len(posts)} bai co URL hop le; "
+            f"DB da ghi nhan {len(seen_posts)} ID"
+        )
+
+        if not posts:
+            raise RuntimeError(
+                "Khong co link bai Facebook nao. "
+                "Kiem tra artifact facebook-debug."
             )
-            print(f"[DEBUG] Đã lưu ảnh Facebook: {screenshot_path}")
-        except Exception as screenshot_error:
-            print(f"[DEBUG] Không thể lưu ảnh Facebook: {screenshot_error}")
 
-        # 1. Tìm theo từng khối bài viết (Feed item)
-        article_locator = page.locator('div[role="feed"] > div, div[role="article"]')
-        article_count = await article_locator.count()
-        post_link_count = await page.locator('a[href*="/posts/"]').count()
-        print(f"[DEBUG] Số khối bài viết: {article_count}")
-        print(f"[DEBUG] Số link /posts/: {post_link_count}")
-        print(f"[DEBUG] Page title: {(await page.title())[:160]}")
-        articles = await article_locator.all()
-        processed_ids = set()
-        recognized_posts = False
-
-        for art in articles[:6]:
-            try:
-                art_text = (await art.inner_text()).strip()
-                if len(art_text) < 30:
-                    continue
-
-                # Lấy link bài viết bên trong chính khối này
-                art_links = await art.locator("a[href]").evaluate_all(
-                    "elements => elements.map(e => e.href)"
-                )
-                post_url = None
-                for l in art_links:
-                    if is_post_link(l):
-                        # Giữ query của permalink.php/story_fbid: bỏ query sẽ hỏng link.
-                        post_url = l.split("#", 1)[0]
-                        break
-
-                if not post_url:
-                    continue
-
-                post_id = get_post_id(post_url)
-                if not post_id:
-                    continue
-                recognized_posts = True
-                if post_id in seen_posts or post_id in processed_ids:
-                    continue
-
-                processed_ids.add(post_id)
-
-                forms_found = extract_forms(art_text)
-                is_ctxh = bool(re.search(r"(?<!\w)ctxh(?!\w)|công\s+tác\s+xã\s+hội", art_text, re.IGNORECASE))
-                has_form = len(forms_found) > 0
-
-                header = "🚨 <b>BÀI MỚI LIÊN QUAN CTXH</b> 🚨\n" if is_ctxh else "📢 <b>BÀI VIẾT MỚI TỪ CTSV HUIT</b>\n"
-                
-                msg_lines = [header]
-                if forms_found:
-                    msg_lines.append("⚡ <b>LINK FORM ĐIỀN NGAY:</b>")
-                    for f in forms_found:
-                        msg_lines.append(f'👉 <a href="{html.escape(f, quote=True)}">{html.escape(f)}</a>')
-                    msg_lines.append("")
-
-                preview = art_text[:400] + ("..." if len(art_text) > 400 else "")
-                msg_lines.append(f"📝 <b>Nội dung tóm tắt:</b>\n{html.escape(preview)}\n")
-                msg_lines.append(f'🔗 <a href="{html.escape(post_url, quote=True)}">Xem bài viết gốc trên Facebook</a>')
-
-                message = "\n".join(msg_lines)
-                keyboard = {
-                    "inline_keyboard": [
-                        [{"text": "🚀 MỞ FORM ĐĂNG KÝ NGAY", "url": forms_found[0]}],
-                        [{"text": "📖 Xem bài viết Facebook", "url": post_url}]
-                    ]
-                } if forms_found else {
-                    "inline_keyboard": [
-                        [{"text": "📖 Xem bài viết Facebook", "url": post_url}]
-                    ]
-                }
-
-                print(f"[BÀI MỚI PHÁT HIỆN]: {post_url}")
-                if not send_telegram(message, reply_markup=keyboard):
-                    raise RuntimeError(f"Gửi Telegram thất bại: {post_url}")
-                seen_posts.add(post_id)
-                new_found += 1
-                save_seen_posts(seen_posts)
-
-
-            except Exception as art_err:
-                print(f"[Lỗi đọc bài]: {art_err}")
-                raise
-
-        # 2. Fallback: chỉ dùng nếu không lấy được URL từ container.
-        # Không nhầm "tất cả bài đã xem" với "không bóc tách được".
-        if not recognized_posts:
-            print("[DEBUG] Chưa nhận diện bài từ khối; đang thử fallback.")
-            page_links = await page.locator("a[href]").evaluate_all(
-                "elements => elements.map(e => e.href)"
+        if len(posts) < 3:
+            print(
+                "[CANH BAO] Facebook chi tra ve rat it bai. "
+                "Co the bi gioi han khi chua dang nhap."
             )
-            fallback_found = False
-            print(f"[DEBUG] Tổng số liên kết trên trang: {len(page_links)}")
-            for link in page_links:
-                if not is_post_link(link):
-                    continue
-                post_url = link.split("#", 1)[0]
-                post_id = get_post_id(post_url)
-                if not post_id:
-                    continue
-                fallback_found = True
-                if post_id in seen_posts:
-                    continue
-                msg = (
-                    "📢 <b>BÀI VIẾT MỚI TỪ CTSV HUIT</b>\n"
-                    "⚠️ Chưa lấy được nội dung để xác định CTXH.\n\n"
-                    f'<a href="{html.escape(post_url, quote=True)}">Xem bài viết gốc trên Facebook</a>'
-                )
-                kb = {"inline_keyboard": [[{"text": "📖 Xem bài viết Facebook", "url": post_url}]]}
-                print(f"[BÀI MỚI FALLBACK]: {post_url}")
-                if not send_telegram(msg, reply_markup=kb):
-                    raise RuntimeError(f"Gửi Telegram fallback thất bại: {post_url}")
-                seen_posts.add(post_id)
-                new_found += 1
-                save_seen_posts(seen_posts)
-                # Tiếp tục để không bỏ sót các link bài mới trong fallback.
-            if not fallback_found:
-                # Save a diagnostic screenshot; do not store secrets or full HTML.
-                debug_dir = os.path.join(BASE_DIR, "debug")
-                os.makedirs(debug_dir, exist_ok=True)
-                screenshot_path = os.path.join(debug_dir, "facebook_page.png")
-                try:
-                    await page.screenshot(path=screenshot_path, full_page=False, timeout=10000)
-                    print(f"[DEBUG] Đã chụp trang vào: {screenshot_path}")
-                except Exception as shot_err:
-                    print(f"[DEBUG] Không chụp được ảnh: {shot_err}")
-                # Page text snippet is diagnostic only, not used as evidence of a post.
-                body_sample = await page.locator("body").inner_text(timeout=5000)
-                print(f"[DEBUG] Page body (first 350 chars): {body_sample[:350]!r}")
-                raise RuntimeError("Trang Facebook không chứa bài theo các bộ chọn hiện có; xem debug/facebook_page.png để xác định nguyên nhân")
 
-        print(f"[DEBUG] Đã nhận diện bài từ khối: {recognized_posts}; số thông báo mới: {new_found}")
-        if new_found > 0:
+        found = 0
+
+        for post in posts.values():
+            if post["id"] in seen_posts:
+                continue
+
+            print(
+                f"[MOI] {post['url']} | "
+                f"noi dung {len(post['text'])} ky tu"
+            )
+
+            msg, keyboard = make_message(post)
+
+            if not send_telegram(msg, keyboard):
+                raise RuntimeError(
+                    "Gui Telegram that bai; "
+                    "khong danh dau bai nay da doc"
+                )
+
+            seen_posts.add(post["id"])
             save_seen_posts(seen_posts)
-            print(f"-> Đã gửi thành công {new_found} bài mới qua Telegram.")
-        else:
-            print("-> Không có bài viết mới.")
+            found += 1
 
-    except Exception as e:
-        print(f"[LỖI QUÉT TRANG]: {e}")
-        raise  # Báo workflow thất bại, thay vì hiển thị màu xanh giả.
+        print(
+            f"[KET QUA] Nhin thay {len(posts)} bai; "
+            f"gui moi {found}; "
+            f"da xem {len(posts) - found}"
+        )
+
     finally:
         await context.close()
 
+
 async def main():
     seen_posts = load_seen_posts()
-    is_once = "--once" in sys.argv or os.environ.get("RUN_ONCE") == "true"
-    
+
+    once = (
+        "--once" in sys.argv
+        or os.environ.get("RUN_ONCE", "").lower() == "true"
+    )
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        if is_once:
-            print("=== BOT CHẠY CHẾ ĐỘ 1 LẦN (GITHUB ACTIONS) ===")
-            await check_fanpage(browser, seen_posts)
-            await browser.close()
-            return
-
-        interval = int(CONFIG.get("CHECK_INTERVAL_SECONDS", 120))
-        print(f"=== BOT THEO DÕI CTSV HUIT ĐÃ KHỞI CHẠY ===")
-        print(f"Chu kỳ quét: {interval} giây/lần.")
-        print("Nhấn Ctrl + C để dừng bot.")
 
         try:
-            while True:
+            if once:
                 await check_fanpage(browser, seen_posts)
-                await asyncio.sleep(interval)
-        except KeyboardInterrupt:
-            print("\nĐã dừng bot.")
+            else:
+                interval = int(CONFIG["CHECK_INTERVAL_SECONDS"])
+
+                while True:
+                    await check_fanpage(browser, seen_posts)
+                    await asyncio.sleep(interval)
+
         finally:
             await browser.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

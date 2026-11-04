@@ -1,119 +1,96 @@
+import asyncio
+import html
+import json
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from playwright.async_api import async_playwright
 
-                header = "🚨 <b>[CÓ LINK ĐĂNG KÝ CTXH MỚI]</b> 🚨\n" if (is_ctxh or has_form) else "📢 <b>BÀI VIẾT MỚI TỪ CTSV HUIT</b>\n"
-                
-                msg_lines = [header]
-                if forms_found:
-                    msg_lines.append("⚡ <b>LINK FORM ĐIỀN NGAY:</b>")
-                    for f in forms_found:
-                        msg_lines.append(f'👉 <a href="{html.escape(f, quote=True)}">{html.escape(f)}</a>')
-                    msg_lines.append("")
+sys.stdout.reconfigure(encoding='utf-8')
 
-                preview = art_text[:400] + ("..." if len(art_text) > 400 else "")
-                msg_lines.append(f"📝 <b>Nội dung tóm tắt:</b>\n{html.escape(preview)}\n")
-                msg_lines.append(f'🔗 <a href="{html.escape(post_url, quote=True)}">Xem bài viết gốc trên Facebook</a>')
+# Đường dẫn file
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE = os.path.join(BASE_DIR, ".env")
+DB_FILE = os.path.join(BASE_DIR, "seen_posts.json")
 
-                message = "\n".join(msg_lines)
-                keyboard = {
-                    "inline_keyboard": [
-                        [{"text": "🚀 MỞ FORM ĐĂNG KÝ NGAY", "url": forms_found[0]}],
-                        [{"text": "📖 Xem bài viết Facebook", "url": post_url}]
-                    ]
-                } if forms_found else {
-                    "inline_keyboard": [
-                        [{"text": "📖 Xem bài viết Facebook", "url": post_url}]
-                    ]
-                }
+def load_config():
+    config = {
+        "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+        "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", ""),
+        "CHECK_INTERVAL_SECONDS": int(os.environ.get("CHECK_INTERVAL_SECONDS", 120)),
+        "PAGE_URL": os.environ.get("PAGE_URL", "https://www.facebook.com/ctsv.huit")
+    }
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, val = line.split("=", 1)
+                    if not config.get(key.strip()):
+                        config[key.strip()] = val.strip()
+    return config
 
-                print(f"[BÀI MỚI PHÁT HIỆN]: {post_url}")
-                if not send_telegram(message, reply_markup=keyboard):
-                    raise RuntimeError(f"Gửi Telegram thất bại: {post_url}")
-                seen_posts.add(post_id)
-                new_found += 1
-                save_seen_posts(seen_posts)
+CONFIG = load_config()
 
-                if is_ctxh or has_form:
-                    await asyncio.sleep(1.5)
-                    alert_1 = "🚨🚨🚨 <b>BÁO ĐỘNG ĐỎ: CÓ FORM CTXH MỚI!</b> 🚨🚨🚨\n👉 Bấm vào form điền ngay kẻo full slot bạn ơi!"
-                    send_telegram(alert_1)
-                    
-                    await asyncio.sleep(1.5)
-                    alert_2 = "⚡⚡⚡ <b>ĐỪNG BỎ LỠ!</b> Kiểm tra form đăng ký ngay lập tức! ⚡⚡⚡"
-                    send_telegram(alert_2)
+def send_telegram(text: str, reply_markup=None):
+    token = CONFIG["TELEGRAM_BOT_TOKEN"]
+    chat_id = CONFIG["TELEGRAM_CHAT_ID"]
+    if not token or not chat_id:
+        print("[LỖI] Thiếu TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID trong .env")
+        return False
 
-            except Exception as art_err:
-                print(f"[Lỗi đọc bài]: {art_err}")
-                raise
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
 
-        # 2. Fallback: chỉ dùng nếu không lấy được URL từ container.
-        # Không nhầm "tất cả bài đã xem" với "không bóc tách được".
-        if not processed_ids:
-            page_links = await page.locator("a[href]").evaluate_all(
-                "elements => elements.map(e => e.href)"
-            )
-            fallback_found = False
-            for link in page_links:
-                if not is_post_link(link):
-                    continue
-                post_url = link.split("#", 1)[0]
-                post_id = get_post_id(post_url)
-                if not post_id:
-                    continue
-                fallback_found = True
-                if post_id in seen_posts:
-                    continue
-                msg = (
-                    "📢 <b>BÀI VIẾT MỚI TỪ CTSV HUIT</b>\n\n"
-                    f'<a href="{html.escape(post_url, quote=True)}">Xem bài viết gốc trên Facebook</a>'
-                )
-                kb = {"inline_keyboard": [[{"text": "📖 Xem bài viết Facebook", "url": post_url}]]}
-                print(f"[BÀI MỚI FALLBACK]: {post_url}")
-                if not send_telegram(msg, reply_markup=kb):
-                    raise RuntimeError(f"Gửi Telegram fallback thất bại: {post_url}")
-                seen_posts.add(post_id)
-                new_found += 1
-                save_seen_posts(seen_posts)
-                # Giữ giới hạn 1 bài trong fallback như bản gốc.
-                break
-            if not fallback_found:
-                raise RuntimeError("Không tìm thấy khối bài viết hoặc link bài đăng; có thể Facebook chặn tải nội dung")
-
-        if new_found > 0:
-            save_seen_posts(seen_posts)
-            print(f"-> Đã gửi thành công {new_found} bài mới qua Telegram.")
-        else:
-            print("-> Không có bài viết mới.")
-
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
     except Exception as e:
-        print(f"[LỖI QUÉT TRANG]: {e}")
-        raise  # Báo workflow thất bại, thay vì hiển thị màu xanh giả.
-    finally:
-        await context.close()
+        print(f"[LỖI GỬI TELEGRAM]: {e}")
+        return False
 
-async def main():
-    seen_posts = load_seen_posts()
-    is_once = "--once" in sys.argv or os.environ.get("RUN_ONCE") == "true"
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        if is_once:
-            print("=== BOT CHẠY CHẾ ĐỘ 1 LẦN (GITHUB ACTIONS) ===")
-            await check_fanpage(browser, seen_posts)
-            await browser.close()
-            return
-
-        interval = int(CONFIG.get("CHECK_INTERVAL_SECONDS", 120))
-        print(f"=== BOT THEO DÕI CTSV HUIT ĐÃ KHỞI CHẠY ===")
-        print(f"Chu kỳ quét: {interval} giây/lần.")
-        print("Nhấn Ctrl + C để dừng bot.")
-
+def load_seen_posts():
+    if os.path.exists(DB_FILE):
         try:
-            while True:
-                await check_fanpage(browser, seen_posts)
-                await asyncio.sleep(interval)
-        except KeyboardInterrupt:
-            print("\nĐã dừng bot.")
-        finally:
-            await browser.close()
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+def save_seen_posts(seen: set):
+    # Không cắt ngẫu nhiên các ID: tránh gửi lại bài cũ khi set đổi thứ tự.
+    post_list = sorted(seen)
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(post_list, f, ensure_ascii=False, indent=2)
+
+def extract_forms(text: str):
+    """Tìm tất cả các link form (Google Form, MS Form, v.v.) trong nội dung"""
+    patterns = [
+        r'https?://(?:forms\.gle|docs\.google\.com/forms|forms\.office\.com|goo\.gl/forms)[^\s\)\"\'>]+',
+        r'https?://[^\s\)\"\'>]+(?:form|dang-ky|dangky)[^\s\)\"\'>]*'
+    ]
+    forms = []
+    for pat in patterns:
+        matches = re.findall(pat, text, re.IGNORECASE)
+        for m in matches:
+            clean = m.rstrip(".,;!?")
+            if clean not in forms:
+                forms.append(clean)
+    return forms
+
+def is_post_link(link: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(link)

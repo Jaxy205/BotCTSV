@@ -1,16 +1,11 @@
-
 name: Theo Doi CTSV HUIT
 
 on:
   schedule:
-    # Sang: 08:03 - 11:23 VN
     - cron: '3-53/10 1-3 * * 1-5'
     - cron: '3-23/10 4 * * 1-5'
-
-    # Chieu: 13:03 - 16:23 VN
     - cron: '3-53/10 6-8 * * 1-5'
     - cron: '3-23/10 9 * * 1-5'
-
   workflow_dispatch:
 
 permissions:
@@ -24,7 +19,6 @@ jobs:
   track:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -55,20 +49,25 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PAGE_URL: "https://www.facebook.com/ctsv.huit"
-        run: |
-          python bot.py --once
+          PAGE_URL: 'https://www.facebook.com/ctsv.huit'
+        run: python bot.py --once
+
+      - name: Upload Facebook diagnostic screenshot
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: facebook-debug-${{ github.run_number }}
+          path: debug/facebook_page.png
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Save seen posts
+        if: success()
         run: |
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-
           git add seen_posts.json
-
-          if git diff --cached --quiet; then
-            echo "Khong co thay doi."
-          else
+          if ! git diff --cached --quiet; then
             git commit -m "update: seen posts"
             git pull --rebase origin main
             git push origin HEAD:main
